@@ -1,7 +1,7 @@
 from uuid import uuid4
 
 from .audit import AuditTrail
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, NotFoundError, PermissionDenied
 from .rules import RuleEngine
 
 
@@ -17,10 +17,18 @@ class DomainService:
     def health(self):
         return {"status": "ok" if self.repository.ping() else "error"}
 
+    def _record_denied(self, actor, entity_id, action, detail):
+        self.audit.record(entity_id, actor, action + "_denied", None, "denied", detail)
+
     def create(self, actor, kind, data, idempotency_key=None):
         kind = self.rules.normalize_kind(kind)
         payload = dict(data or {})
-        if idempotency_key:
+        if kind == "event_group":
+            self._record_denied(actor, "event_group", "create_event_group", {"reason": "groups are reconciled"})
+            raise PermissionDenied("event groups are created by report reconciliation only")
+        if kind == "candidate" and idempotency_key and not payload.get("report_id"):
+            payload["report_id"] = idempotency_key
+        if idempotency_key and kind != "candidate":
             existing = self.repository.get_idempotency(actor.user_id, idempotency_key)
             if existing:
                 entity = self.repository.get_entity(existing)
@@ -30,6 +38,17 @@ class DomainService:
         if validated:
             payload.update(validated)
         entity_id = str(payload.pop("id", "") or uuid4())
+
+        if kind == "candidate":
+            return self.repository.ingest_candidate(
+                entity_id,
+                self.rules.initial_status(kind),
+                payload,
+                actor.user_id,
+                idempotency_key,
+                actor.role,
+            )
+
         if self.repository.get_entity(entity_id):
             raise ConflictError("entity already exists: " + entity_id)
         status = self.rules.initial_status(kind)
@@ -44,11 +63,40 @@ class DomainService:
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
         expected = int(expected_version) if expected_version is not None else entity["version"]
-        next_status, patch = self.rules.validate_transition(
-            actor, entity, action, dict(data or {}), self._lookup
-        )
+
+        if entity["kind"] == "event_group" and action == "split":
+            return self._split_group(actor, entity, action, data, expected)
+
+        try:
+            next_status, patch = self.rules.validate_transition(
+                actor, entity, action, dict(data or {}), self._lookup
+            )
+        except PermissionDenied as exc:
+            self._record_denied(
+                actor,
+                entity_id,
+                action,
+                {"reason": str(exc), "kind": entity["kind"], "version": entity["version"]},
+            )
+            raise
+
         merged = dict(entity["data"])
         merged.update(patch)
+
+        if entity["kind"] == "candidate":
+            updated, _group = self.repository.update_candidate_and_group(
+                entity_id,
+                expected,
+                next_status,
+                merged,
+                actor,
+                action,
+                entity["status"],
+                deactivate_report=(action == "withdraw"),
+                sync_report=action in {"merge_measurement", "reclassify", "correct"},
+            )
+            return updated
+
         updated = self.repository.update_entity(entity_id, expected, next_status, merged)
         self.audit.record(
             entity_id,
@@ -59,6 +107,39 @@ class DomainService:
             {"patch": patch},
         )
         return updated
+
+    def _split_group(self, actor, entity, action, data, expected_version):
+        payload = dict(data or {})
+        try:
+            _next_status, patch = self.rules.validate_transition(
+                actor, entity, action, payload, self._lookup
+            )
+        except PermissionDenied as exc:
+            self._record_denied(
+                actor,
+                entity["id"],
+                action,
+                {"reason": str(exc), "version": entity["version"], "data": payload},
+            )
+            raise
+        try:
+            remaining, new_group = self.repository.split_event_group(
+                entity["id"],
+                actor,
+                patch["candidate_ids"],
+                patch["reason"],
+                expected_version,
+            )
+        except ConflictError as exc:
+            # The losing concurrent request keeps the original group and sees a conflict.
+            self._record_denied(
+                actor,
+                entity["id"],
+                action + "_conflict",
+                {"reason": str(exc), "candidate_ids": patch["candidate_ids"]},
+            )
+            raise
+        return remaining
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)

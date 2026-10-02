@@ -1,4 +1,5 @@
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+from .matching import parse_utc
 
 
 def _find_one(lookup, kind, field, value):
@@ -48,9 +49,19 @@ def _validate_candidate(actor, data, lookup):
         raise ValidationError("ra and dec must be numeric")
     if ra < 0 or ra >= 360 or dec < -90 or dec > 90:
         raise ValidationError("coordinates are outside valid ranges")
+    if parse_utc(data.get("observed_at")) is None:
+        raise ValidationError("observed_at must be an ISO-8601 timestamp")
+    try:
+        magnitude = float(data.get("magnitude"))
+    except (TypeError, ValueError):
+        raise ValidationError("magnitude must be numeric")
     event_key = "%s:%s" % (source_id, data.get("event_id"))
     duplicate = _find_one(lookup, "candidate", "event_key", event_key)
-    if duplicate:
+    if (
+        duplicate
+        and duplicate.get("status") != "withdrawn"
+        and duplicate["data"].get("report_id") != data.get("report_id")
+    ):
         raise ConflictError("candidate already exists for event key " + event_key)
     return {
         "event_key": event_key,
@@ -95,8 +106,8 @@ def _validate_merge_measurement(actor, entity, data, lookup):
     if ra < 0 or ra >= 360 or dec < -90 or dec > 90:
         raise ValidationError("measurement coordinates are outside valid ranges")
     observed_at = str(measurement.get("observed_at", "")).strip()
-    if not observed_at:
-        raise ValidationError("measurement observed_at is required")
+    if not observed_at or parse_utc(observed_at) is None:
+        raise ValidationError("measurement observed_at must be an ISO-8601 timestamp")
     existing = list(entity["data"].get("measurements") or [])
     if any(item.get("observed_at") == observed_at for item in existing):
         raise ConflictError("measurement timestamp already merged")
@@ -113,13 +124,40 @@ def _validate_merge_measurement(actor, entity, data, lookup):
 def _validate_reclassify(actor, entity, data, lookup):
     if data.get("new_type") not in {"grb", "supernova", "tde", "variable", "unknown"}:
         raise ValidationError("unsupported transient type")
-    return {"transient_type": data["new_type"], "previous_type": entity["data"].get("transient_type")}
+    latest_magnitude = entity["data"].get("latest_magnitude", entity["data"].get("magnitude"))
+    return {
+        "transient_type": data["new_type"],
+        "previous_type": entity["data"].get("transient_type"),
+        "priority_score": calculate_priority(latest_magnitude, data["new_type"]),
+    }
 
 
 def _validate_correct(actor, entity, data, lookup):
     if not str(data.get("reason", "")).strip():
         raise ValidationError("correction reason is required")
-    return {"corrected_by": actor.user_id}
+    patch = {"corrected_by": actor.user_id}
+    if entity["kind"] == "candidate":
+        ra = data.get("ra", entity["data"].get("ra"))
+        dec = data.get("dec", entity["data"].get("dec"))
+        observed_at = data.get("observed_at", entity["data"].get("observed_at"))
+        magnitude = data.get("magnitude", entity["data"].get("latest_magnitude", entity["data"].get("magnitude")))
+        try:
+            ra = float(ra)
+            dec = float(dec)
+            magnitude = float(magnitude)
+        except (TypeError, ValueError):
+            raise ValidationError("candidate corrections require numeric coordinates and magnitude")
+        if ra < 0 or ra >= 360 or dec < -90 or dec > 90:
+            raise ValidationError("correction coordinates are outside valid ranges")
+        if not str(observed_at).strip() or parse_utc(observed_at) is None:
+            raise ValidationError("correction observed_at must be an ISO-8601 timestamp")
+        patch.update({"ra": ra, "dec": dec, "observed_at": observed_at, "magnitude": magnitude})
+        if "latest_magnitude" in entity["data"]:
+            patch["latest_magnitude"] = magnitude
+        patch["priority_score"] = calculate_priority(
+            magnitude, entity["data"].get("transient_type")
+        )
+    return patch
 
 
 def _validate_schedule(actor, entity, data, lookup):
@@ -148,18 +186,45 @@ def _validate_schedule(actor, entity, data, lookup):
     return {"scheduled_by": actor.user_id}
 
 
+def _validate_split_group(actor, entity, data, lookup):
+    member_ids = data.get("candidate_ids")
+    if not isinstance(member_ids, list) or not member_ids:
+        raise ValidationError("candidate_ids must be a non-empty list")
+    current = set(entity["data"].get("candidate_ids") or [])
+    missing = [candidate_id for candidate_id in member_ids if candidate_id not in current]
+    if missing:
+        raise ConflictError("candidates are not active members of this group: " + ",".join(missing))
+    if len(member_ids) >= len(current):
+        raise ConflictError("cannot split every member out of an event group")
+    if not str(data.get("reason", "")).strip():
+        raise ValidationError("reason is required")
+    return {
+        "candidate_ids": sorted(set(member_ids)),
+        "split_by": actor.user_id,
+        "reason": str(data["reason"]).strip(),
+    }
+
+
+def _validate_confirm_group(actor, entity, data, lookup):
+    if not entity["data"].get("candidate_ids"):
+        raise InvalidTransition("cannot confirm an event group without valid reports")
+    return {"confirmed_by": actor.user_id}
+
+
 class RuleEngine:
     ALIASES = {
         "sources": "source",
         "candidates": "candidate",
         "telescopes": "telescope",
         "observations": "observation",
+        "event_groups": "event_group",
     }
     INITIAL_STATUS = {
         "source": "registered",
         "candidate": "detected",
         "telescope": "available",
         "observation": "requested",
+        "event_group": "provisional",
     }
     TRANSITIONS = {
         "source": {
@@ -184,6 +249,10 @@ class RuleEngine:
             "withdraw": (("requested", "scheduled"), "withdrawn"),
             "correct": (("requested", "scheduled"), "requested"),
         },
+        "event_group": {
+            "confirm": (("provisional", "confirmed"), "confirmed"),
+            "split": (("provisional", "confirmed"), "provisional"),
+        },
     }
     CREATE_REQUIRED = {
         "source": ("name", "survey_name"),
@@ -203,6 +272,8 @@ class RuleEngine:
         ("observation", "schedule"): ("operator_id",),
         ("observation", "withdraw"): ("reason",),
         ("observation", "correct"): ("reason",),
+        ("event_group", "confirm"): (),
+        ("event_group", "split"): ("candidate_ids", "reason"),
     }
     CREATE_ROLES = {
         "source": ("analyst", "admin"),
@@ -223,6 +294,8 @@ class RuleEngine:
         "restore": ("coordinator", "admin"),
         "schedule": ("coordinator", "admin"),
         "complete": ("operator", "coordinator", "admin"),
+        "confirm": ("coordinator", "supervisor", "admin"),
+        "split": ("coordinator", "supervisor", "admin"),
     }
     CUSTOM_CREATE = {
         "source": _validate_source,
@@ -236,6 +309,8 @@ class RuleEngine:
         ("candidate", "correct"): _validate_correct,
         ("observation", "schedule"): _validate_schedule,
         ("observation", "correct"): _validate_correct,
+        ("event_group", "confirm"): _validate_confirm_group,
+        ("event_group", "split"): _validate_split_group,
     }
 
     def normalize_kind(self, kind):
@@ -274,11 +349,11 @@ class RuleEngine:
         if not transition:
             raise InvalidTransition("unknown action %s for %s" % (action, kind))
         allowed_statuses, next_status = transition
-        if entity["status"] not in allowed_statuses:
-            raise InvalidTransition("cannot %s from status %s" % (action, entity["status"]))
         allowed_roles = self.ROLE_ACTIONS.get((kind, action), self.ROLE_ACTIONS.get(action, ("admin",)))
         self._ensure_role(actor, allowed_roles)
         self._require(data, self.ACTION_REQUIRED.get((kind, action), ()))
+        if entity["status"] not in allowed_statuses:
+            raise InvalidTransition("cannot %s from status %s" % (action, entity["status"]))
         custom = self.CUSTOM_TRANSITIONS.get((kind, action))
         extra = custom(actor, entity, data, lookup) if custom else {}
         patch = dict(data)
