@@ -1,4 +1,12 @@
+import math
+from datetime import datetime, timezone
+
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+
+
+# Reconciliation thresholds for cross-source event grouping.
+RECONCILIATION_ARCMIN = 2.0
+RECONCILIATION_SECONDS = 24 * 60 * 60
 
 
 def _find_one(lookup, kind, field, value):
@@ -6,6 +14,71 @@ def _find_one(lookup, kind, field, value):
         return None
     rows = lookup(kind, field, value) or []
     return rows[0] if rows else None
+
+
+def parse_observed_at(value):
+    """Parse an ISO-8601 timestamp (possibly ending in 'Z') to an aware datetime."""
+    text = str(value or "").strip()
+    if not text:
+        raise ValidationError("observed_at is required")
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValidationError("observed_at must be a valid ISO-8601 timestamp")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def angular_separation_deg(ra1, dec1, ra2, dec2):
+    """Great-circle separation between two equatorial coordinates, in degrees."""
+    r1, d1, r2, d2 = map(math.radians, (float(ra1), float(dec1), float(ra2), float(dec2)))
+    dra = r2 - r1
+    ddec = d2 - d1
+    a = math.sin(ddec / 2.0) ** 2 + math.cos(d1) * math.cos(d2) * math.sin(dra / 2.0) ** 2
+    return math.degrees(2.0 * math.asin(min(1.0, math.sqrt(a))))
+
+
+def within_reconciliation(ra1, dec1, time1, ra2, dec2, time2):
+    """True when two reports describe the same transient per the reconciliation rules."""
+    separation = angular_separation_deg(ra1, dec1, ra2, dec2)
+    if separation > RECONCILIATION_ARCMIN / 60.0:
+        return False
+    delta = abs((parse_observed_at(time1) - parse_observed_at(time2)).total_seconds())
+    return delta <= RECONCILIATION_SECONDS
+
+
+def latest_measurement(candidate):
+    measurements = list((candidate.get("data") or {}).get("measurements") or [])
+    if not measurements:
+        return None
+    return max(measurements, key=lambda item: str(item.get("observed_at", "")))
+
+
+def select_primary(members):
+    """Pick the main record: brightest latest magnitude, ties broken by earliest
+    observation then earliest creation. Returns the candidate id or None."""
+    best = None
+    for candidate in members or []:
+        latest = latest_measurement(candidate)
+        if latest is None:
+            continue
+        magnitude = latest.get("magnitude")
+        try:
+            magnitude = float(magnitude)
+        except (TypeError, ValueError):
+            magnitude = float("inf")
+        key = (
+            magnitude,
+            str(latest.get("observed_at", "")),
+            str(candidate.get("created_at", "")),
+            str(candidate.get("id", "")),
+        )
+        if best is None or key < best[0]:
+            best = (key, candidate.get("id"))
+    return best[1] if best else None
 
 
 def calculate_priority(magnitude, transient_type):
@@ -148,18 +221,44 @@ def _validate_schedule(actor, entity, data, lookup):
     return {"scheduled_by": actor.user_id}
 
 
+def _validate_split(actor, entity, data, lookup):
+    candidate_id = str(data.get("candidate_id", "")).strip()
+    if not candidate_id:
+        raise ValidationError("candidate_id is required to split a group")
+    rows = lookup("candidate", "id", candidate_id) if lookup else []
+    if not rows:
+        raise ValidationError("candidate does not exist")
+    member_ids = list((entity.get("data") or {}).get("member_ids") or [])
+    if candidate_id not in member_ids:
+        raise ValidationError("candidate is not a member of this group")
+    remaining = [member for member in member_ids if member != candidate_id]
+    remaining_members = []
+    for member in remaining:
+        found = lookup("candidate", "id", member) if lookup else []
+        if found:
+            remaining_members.append(found[0])
+    return {
+        "member_ids": remaining,
+        "primary_candidate_id": select_primary(remaining_members),
+        "split_out_candidate_id": candidate_id,
+    }
+
+
 class RuleEngine:
     ALIASES = {
         "sources": "source",
         "candidates": "candidate",
         "telescopes": "telescope",
         "observations": "observation",
+        "event_groups": "event_group",
+        "groups": "event_group",
     }
     INITIAL_STATUS = {
         "source": "registered",
         "candidate": "detected",
         "telescope": "available",
         "observation": "requested",
+        "event_group": "active",
     }
     TRANSITIONS = {
         "source": {
@@ -184,12 +283,17 @@ class RuleEngine:
             "withdraw": (("requested", "scheduled"), "withdrawn"),
             "correct": (("requested", "scheduled"), "requested"),
         },
+        "event_group": {
+            "confirm": (("active", "confirmed"), "confirmed"),
+            "split": (("active", "confirmed"), "active"),
+        },
     }
     CREATE_REQUIRED = {
         "source": ("name", "survey_name"),
         "candidate": ("source_id", "event_id", "ra", "dec", "magnitude", "transient_type", "observed_at"),
         "telescope": ("name", "aperture_m", "site_name"),
         "observation": ("candidate_id", "telescope_id", "team_id", "start_at", "end_at", "mode"),
+        "event_group": (),
     }
     ACTION_REQUIRED = {
         ("source", "retire"): ("reason",),
@@ -203,12 +307,14 @@ class RuleEngine:
         ("observation", "schedule"): ("operator_id",),
         ("observation", "withdraw"): ("reason",),
         ("observation", "correct"): ("reason",),
+        ("event_group", "split"): ("candidate_id",),
     }
     CREATE_ROLES = {
         "source": ("analyst", "admin"),
         "candidate": ("analyst", "operator", "admin"),
         "telescope": ("coordinator", "admin"),
         "observation": ("analyst", "coordinator", "admin"),
+        "event_group": ("admin",),
     }
     ROLE_ACTIONS = {
         "activate": ("coordinator", "admin"),
@@ -223,6 +329,8 @@ class RuleEngine:
         "restore": ("coordinator", "admin"),
         "schedule": ("coordinator", "admin"),
         "complete": ("operator", "coordinator", "admin"),
+        "confirm": ("analyst", "supervisor", "admin"),
+        "split": ("supervisor", "admin"),
     }
     CUSTOM_CREATE = {
         "source": _validate_source,
@@ -236,6 +344,7 @@ class RuleEngine:
         ("candidate", "correct"): _validate_correct,
         ("observation", "schedule"): _validate_schedule,
         ("observation", "correct"): _validate_correct,
+        ("event_group", "split"): _validate_split,
     }
 
     def normalize_kind(self, kind):
